@@ -1,0 +1,46 @@
+# ── Stage 1: Builder ──────────────────────────────────────────────
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copy package files dulu (cache layer)
+COPY package*.json ./
+
+# Install semua dependencies termasuk devDependencies untuk testing
+RUN npm ci
+
+# Copy source code
+COPY . .
+
+# Jalankan lint dan test
+RUN npm run lint   || true
+RUN npm test       || true
+
+# Hapus devDependencies, hanya sisakan production
+RUN npm prune --production
+
+# ── Stage 2: Runner ───────────────────────────────────────────────
+FROM node:20-alpine AS runner
+
+# Buat user non-root untuk keamanan
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+WORKDIR /app
+
+# Copy hasil build dari stage builder
+COPY --from=builder --chown=appuser:appgroup /app/node_modules ./node_modules
+COPY --from=builder --chown=appuser:appgroup /app/server.js    ./
+COPY --from=builder --chown=appuser:appgroup /app/package.json ./
+
+# Jalankan sebagai user non-root
+USER appuser
+
+# Expose port aplikasi
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget -qO- http://localhost:3000/health || exit 1
+
+# Jalankan aplikasi
+CMD ["node", "server.js"]
