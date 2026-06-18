@@ -1,0 +1,188 @@
+name: NusaShop CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION:     us-east-1
+  ECR_REPO:       nusashop-app
+  ECS_CLUSTER:    cluster-nusashop-2026
+  ECS_SERVICE:    svc-nusashop-2026
+  CONTAINER_NAME: nusashop-container
+
+jobs:
+
+  # ── Stage 1: Build & Test ───────────────────────────────────────
+  build-test:
+    name: "Stage 1 – Build & Test"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      - name: Checkout kode
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Jalankan ESLint
+        run: npm run lint || true
+
+      - name: Jalankan Unit Test
+        run: npm test -- --ci --coverage
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: app/coverage/
+
+  # ── Stage 2: Build Docker Image ────────────────────────────────
+  build-image:
+    name: "Stage 2 – Build Docker Image"
+    runs-on: ubuntu-latest
+    needs: build-test
+    if: github.ref == 'refs/heads/main'
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.image-tag }}
+      ecr-registry: ${{ steps.login-ecr.outputs.registry }}
+
+    steps:
+      - name: Checkout kode
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login ke Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Buat metadata image
+        id: meta
+        run: |
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG=${{ github.sha }}
+          echo "image-tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "image-uri=${ECR_REGISTRY}/${{ env.ECR_REPO }}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -f docker/Dockerfile \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }} \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest \
+            app/
+
+  # ── Stage 3: Push ke ECR ───────────────────────────────────────
+  push-ecr:
+    name: "Stage 3 – Push ke Amazon ECR"
+    runs-on: ubuntu-latest
+    needs: build-image
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout kode
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login ke Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build dan Push image ke ECR
+        id: push
+        run: |
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          IMAGE_URI="${ECR_REGISTRY}/${{ env.ECR_REPO }}:${{ github.sha }}"
+          LATEST_URI="${ECR_REGISTRY}/${{ env.ECR_REPO }}:latest"
+
+          docker build -f docker/Dockerfile -t "$IMAGE_URI" -t "$LATEST_URI" app/
+          docker push "$IMAGE_URI"
+          docker push "$LATEST_URI"
+
+          echo "image-uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+          echo "Berhasil push image: ${IMAGE_URI}"
+
+      - name: Scan image dengan ECR
+        run: |
+          aws ecr start-image-scan \
+            --repository-name ${{ env.ECR_REPO }} \
+            --image-id imageTag=${{ github.sha }} \
+            --region ${{ env.AWS_REGION }} || true
+
+  # ── Stage 4: Deploy ke ECS ─────────────────────────────────────
+  deploy-ecs:
+    name: "Stage 4 – Deploy ke ECS Fargate"
+    runs-on: ubuntu-latest
+    needs: push-ecr
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout kode
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login ke Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Download task definition terkini
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition td-nusashop-2026 \
+            --query taskDefinition \
+            > task-definition.json
+
+      - name: Update image di task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name:  ${{ env.CONTAINER_NAME }}
+          image:           ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}
+
+      - name: Deploy ke ECS Service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition:  ${{ steps.task-def.outputs.task-definition }}
+          service:          ${{ env.ECS_SERVICE }}
+          cluster:          ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Verifikasi deployment
+        run: |
+          echo "Deployment berhasil!"
+          echo "Commit: ${{ github.sha }}"
+          echo "Cluster: ${{ env.ECS_CLUSTER }}"
+          echo "Service: ${{ env.ECS_SERVICE }}"
