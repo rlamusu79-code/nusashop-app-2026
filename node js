@@ -1,0 +1,49 @@
+const express = require('express');
+const app = express();
+const port = process.env.PORT || 3000;
+
+app.use(express.json());
+app.use(express.static('public'));
+
+// Health check endpoint - WAJIB ada untuk ALB health check
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    version: process.env.APP_VERSION || '1.0.0',
+    env: process.env.NODE_ENV || 'development'
+  });
+});
+
+// Home
+app.get('/', (req, res) => {
+  res.json({
+    app: 'NusaShop',
+    message: 'Selamat datang di NusaShop E-Commerce Platform',
+    version: '1.0.0',
+    endpoints: ['/health', '/api/products', '/api/orders', '/api/users']
+  });
+});
+
+// Contoh endpoint produk
+app.get('/api/products', (req, res) => {
+  const products = [
+    { id: 'PRD001', name: 'Laptop Asus VivoBook',   price: 8500000, category: 'Electronics', stock: 15 },
+    { id: 'PRD002', name: 'Sepatu Nike Air Max',     price: 1200000, category: 'Fashion',     stock: 30 },
+    { id: 'PRD003', name: 'Kopi Toraja Premium 500g',price: 125000,  category: 'Food',        stock: 100 },
+    { id: 'PRD004', name: 'Raket Badminton Yonex',   price: 850000,  category: 'Sport',       stock: 20 },
+    { id: 'PRD005', name: 'Novel Laskar Pelangi',    price: 75000,   category: 'Books',       stock: 50 },
+  ];
+  res.json({ ok: true, data: products, total: products.length });
+});
+
+// Contoh endpoint orders
+app.get('/api/orders', (req, res) => {
+  res.json({ ok: true, data: [], message: 'Orders endpoint ready' });
+});
+
+app.listen(port, () => {
+  console.log(`NusaShop berjalan di port ${port}`);
+});
+
+module.exports = app;
